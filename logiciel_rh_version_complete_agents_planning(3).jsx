@@ -71,6 +71,30 @@ const ACTIVITIES={
 const activityColor=(name)=>ACTIVITIES[name]||THEME.b;
 const extractActivity=(label)=>{const m=/\(([^)]+)\)$/.exec(label||''); return m?m[1]:''};
 const extractRange=(label)=>{const m=/^([^ (]+-[^ (]+)/.exec(label||''); return m?m[1]:label};
+const toMinutes=(time)=>{
+  const parts=String(time||'').split(':');
+  const h=parseInt(parts[0]||'0',10);
+  const m=parseInt(parts[1]||'0',10);
+  return (Number.isFinite(h)?h:0)*60+(Number.isFinite(m)?m:0);
+};
+const slotStartMinutes=(entry)=>{
+  const range=extractRange(entry)||'';
+  const start=(range.split('-')[0]||'').trim();
+  return toMinutes(start);
+};
+const normalizeSlotList=(input)=>{
+  const acc=[];
+  const pushVal=(val)=>{
+    if(Array.isArray(val)) val.forEach(pushVal);
+    else if(val!=null){
+      const str=String(val).trim();
+      if(str) acc.push(str);
+    }
+  };
+  pushVal(input);
+  const unique=Array.from(new Set(acc));
+  return unique.sort((a,b)=> slotStartMinutes(a)-slotStartMinutes(b));
+};
 
 // ==========================
 // HEADER
@@ -207,10 +231,38 @@ function PlanningWeekly(){
   ,[agents,filterEtab,filterCorp,filterQuery]);
 
   const getSlots=(id,key)=> (slotsByDate?.[id]?.[key])||[];
-  const setSlots=(id,key,next)=> setSlotsByDate(prev=>{const q={...prev}; const a={...(q[id]||{})}; a[key]=next; q[id]=a; return q;});
+  const setSlots=(id,key,next)=> setSlotsByDate(prev=>{
+    const q={...prev};
+    const agentDays={...(q[id]||{})};
+    const normalized=normalizeSlotList(next);
+    if(normalized.length>0){
+      agentDays[key]=normalized;
+      q[id]=agentDays;
+    } else {
+      delete agentDays[key];
+      if(Object.keys(agentDays).length>0) q[id]=agentDays;
+      else delete q[id];
+    }
+    return q;
+  });
 
   // Suppression robuste + confirmation (modal)
-  const deleteSlot=(agentId,dateKey,index)=> setSlotsByDate(prev=>{ const next={...prev}; const agentDays={...(next[agentId]||{})}; const list=[...(agentDays[dateKey]||[])]; list.splice(index,1); agentDays[dateKey]=list; next[agentId]=agentDays; return next; });
+  const deleteSlot=(agentId,dateKey,index)=> setSlotsByDate(prev=>{
+    const next={...prev};
+    const agentDays={...(next[agentId]||{})};
+    const list=[...(agentDays[dateKey]||[])];
+    if(index>=0 && index<list.length) list.splice(index,1);
+    const normalized=list.length?normalizeSlotList(list):[];
+    if(normalized.length>0){
+      agentDays[dateKey]=normalized;
+      next[agentId]=agentDays;
+    } else {
+      delete agentDays[dateKey];
+      if(Object.keys(agentDays).length>0) next[agentId]=agentDays;
+      else delete next[agentId];
+    }
+    return next;
+  });
   const [slotConfirm, setSlotConfirm] = useState(null);
 
   // === AT/AAC — Ajout de créneaux (samedi/dimanche) avec fréquences 3/6 semaines ===
@@ -218,35 +270,33 @@ function PlanningWeekly(){
   const atAacAgents=filteredAgents.filter(a=> a.team==='AT' || a.team==='AAC');
   const computeInfo=function(day,freq){ return "AT week-end: répéter le "+day+" de la semaine 26 à la semaine 36 (année N) — fréquence "+freq+" semaines."; };
   const openWEAdd=function(day, presetId){ setWeEditor({open:true, agentId:(presetId || (atAacAgents[0]&&atAacAgents[0].id) || ""), day:day, repeat:true, freq:3, excludeFeries:false, excludeVacancesB:false, ranges:[{start:'',end:'',activity:''}]}); };
-  const applyWeekendRepeat=function(agentId, day, freq, formats, opts){
+  const applyWeekendRepeat=function(agentId, day, freq, formats, opts={}){
     const wd = day==='samedi'?6:0; // Saturday=6, Sunday=0
+    const parsedFreq=Number(freq);
+    const step = Math.max(1, Number.isFinite(parsedFreq)?Math.round(parsedFreq):1);
     const N = new Date().getFullYear();
     // Premier samedi/dimanche à partir de la S26 (année N)
-    let d=new Date(N,0,1);
-    while(!(isoWeek(d)>=26 && d.getDay()===wd)) d.setDate(d.getDate()+1);
+    let cursor=new Date(N,0,1);
+    while(!(isoWeek(cursor)>=26 && cursor.getFullYear()===N && cursor.getDay()===wd)){
+      cursor.setDate(cursor.getDate()+1);
+      if(cursor.getFullYear()>N || isoWeek(cursor)>36) break;
+    }
+    const firstWeek=isoWeek(cursor);
+    if(!(cursor.getFullYear()===N && cursor.getDay()===wd && firstWeek>=26 && firstWeek<=36)) return;
     const end=new Date(N,11,31);
-    const isHoliday=function(dt){ const y=dt.getFullYear(); const s=holidaySet(y); return s.has(dkey(dt)); };
-
-    const isZoneB=function(dt){ return isInRanges(dt,getZoneBRanges()); };
-    for(; d<=end; d.setDate(d.getDate()+7*freq)){
+    const isHoliday=(dt)=>{ const y=dt.getFullYear(); const s=holidaySet(y); return s.has(dkey(dt)); };
+    const isZoneB=(dt)=> isInRanges(dt,getZoneBRanges());
+    const safeFormats=normalizeSlotList(formats);
+    if(!safeFormats.length) return;
+    for(let d=new Date(cursor); d<=end; d.setDate(d.getDate()+7*step)){
+      if(d.getFullYear()!==N) break;
       const wk=isoWeek(d);
-      const inWindow=(d.getFullYear()===N && wk>=26 && wk<=36);
+      const inWindow=(wk>=26 && wk<=36);
       if(!inWindow) continue;
       if(opts.excludeFeries && isHoliday(d)) continue;
       if(opts.excludeVacancesB && isZoneB(d)) continue;
       const key=dkey(d);
-      setSlots(agentId,key,[].concat(getSlots(agentId,key), formats));
-    }
-  };
-    const isZoneB=function(dt){ return isInRanges(dt,getZoneBRanges()); };
-    for(; d<=end; d.setDate(d.getDate()+7*freq)){
-      const wk=isoWeek(d);
-      const inWindow=((d.getFullYear()===N && wk>=35) || (d.getFullYear()===N+1 && wk<=26));
-      if(!inWindow) { if(d.getFullYear()>N+1 || (d.getFullYear()===N+1 && wk>26)) break; else continue; }
-      if(opts.excludeFeries && isHoliday(d)) continue;
-      if(opts.excludeVacancesB && isZoneB(d)) continue;
-      const key=dkey(d);
-      setSlots(agentId,key,[].concat(getSlots(agentId,key), formats));
+      setSlots(agentId,key,[...getSlots(agentId,key), ...safeFormats]);
     }
   };
   const saveWEEditor=function(e){
